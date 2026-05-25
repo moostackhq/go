@@ -16,9 +16,6 @@ import (
 	"time"
 )
 
-// Sentinel errors. All errors returned by Migrate that fall into one of
-// these categories wrap the corresponding sentinel, so callers can use
-// errors.Is to dispatch on failure mode.
 var (
 	// ErrDrift is wrapped when an applied migration's stored checksum no
 	// longer matches the file body in source.
