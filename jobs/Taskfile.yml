@@ -1,0 +1,7 @@
+version: '3'
+
+tasks:
+  bench:
+    desc: Run the full benchmark matrix (all backends x worker counts)
+    cmds:
+      - go test -bench=. -benchtime=2s -run='^$' ./bench
