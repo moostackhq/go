@@ -240,7 +240,7 @@ func TestManager_Promote_SetsUserIDAndRotatesSID(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
 
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := mgr.Promote(r.Context(), "user-42"); err != nil {
 			t.Errorf("promote: %v", err)
 		}
@@ -311,7 +311,7 @@ func TestManager_UserID_ReflectsPromoteInSameRequest(t *testing.T) {
 	req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
 
 	var observed string
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := mgr.Promote(r.Context(), "user-42"); err != nil {
 			t.Fatal(err)
 		}
@@ -401,7 +401,7 @@ func TestManager_Destroy_ClearsCookieEvenWhenDeleteFails(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = mgr.Destroy(r.Context())
 	})).ServeHTTP(rr, req)
 
@@ -477,7 +477,7 @@ func TestManager_TTLBumpDebounce(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/", nil)
 		req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
-		mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mgr.Get(r.Context()) // read-only
 		})).ServeHTTP(rr, req)
 		got, _ := store.Load(context.Background(), seed.SID)
@@ -661,7 +661,7 @@ func TestManager_PromoteSucceedsWithoutUserIndexer(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := mgr.Promote(r.Context(), "alice"); err != nil {
 			t.Errorf("Promote should succeed without UserIndexer, got %v", err)
 		}

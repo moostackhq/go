@@ -51,7 +51,7 @@ var (
 
 	// ErrNoSession is returned by [Manager.Get] and friends when no
 	// session state is attached to the context — almost always because
-	// the request did not pass through [Manager.Wrap].
+	// the request did not pass through [Manager.Middleware].
 	ErrNoSession = errors.New("no session attached to context")
 
 	// ErrSessionDestroyed is wrapped by mutating [Manager] methods
