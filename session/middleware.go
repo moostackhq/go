@@ -7,22 +7,28 @@ import (
 	"net/http"
 )
 
-// Wrap returns an [http.Handler] that attaches a session to each
-// request and finalises it just before the response headers are sent.
+// Middleware is the session middleware. It attaches a per-request
+// session to the context on the way in and finalises it just before
+// the response headers are sent.
 //
 // The wrapped handler interacts with the session via the Manager's
 // context-aware methods (Get, Save, Update, Destroy, Renew, Promote,
-// SID, UserID). A request that does not pass through Wrap will get
-// [ErrNoSession] from any of them. The identity lookups
+// SID, UserID). A request that does not pass through Middleware will
+// get [ErrNoSession] from any of them. The identity lookups
 // ([Manager.ListForUser], [Manager.RevokeAllForUser]) operate on a
 // userID directly and do not require a wrapped request.
+//
+// Middleware is itself the middleware — pass the method value to
+// your router (no parens):
+//
+//	r.Use(sessMgr.Middleware)
 //
 // Cookie writes happen as part of the commit, which is triggered by
 // the first WriteHeader or Write on the response. If the handler
 // returns without writing anything, the middleware finalises the
 // session explicitly and emits a 200 OK so the cookie still reaches
 // the client.
-func (m *Manager[T]) Wrap(next http.Handler) http.Handler {
+func (m *Manager[T]) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sid, _ := m.cfg.Token.Read(r)
 		st := &state[T]{origSID: sid, sid: sid}
@@ -116,7 +122,7 @@ func (cw *committingWriter) Flush() {
 // The session is committed before the connection is taken over so a
 // Set-Cookie can still land in any response the caller writes
 // directly. After a successful Hijack the wrapper marks the response
-// as written so [Manager.Wrap]'s tail path will not attempt a stray
+// as written so [Manager.Middleware]'s tail path will not attempt a stray
 // WriteHeader against a writer that no longer owns the connection.
 //
 // If the commit fails and surfaces a 500 to the client before Hijack

@@ -48,7 +48,7 @@ func newE2EManager(t *testing.T) (*Manager[cart], *MemoryStore[cart]) {
 
 func TestE2E_AddItemPersistsAcrossRequests(t *testing.T) {
 	mgr, store := newE2EManager(t)
-	srv := httptest.NewServer(mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/add":
 			if err := mgr.Update(r.Context(), func(c *cart) error {
@@ -102,7 +102,7 @@ func TestE2E_AddItemPersistsAcrossRequests(t *testing.T) {
 
 func TestE2E_DestroyClearsCookieAndStore(t *testing.T) {
 	mgr, store := newE2EManager(t)
-	srv := httptest.NewServer(mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/login":
 			if err := mgr.Update(r.Context(), func(c *cart) error {
@@ -160,7 +160,7 @@ func TestE2E_DestroyClearsCookieAndStore(t *testing.T) {
 func TestE2E_RenewRotatesSID(t *testing.T) {
 	mgr, store := newE2EManager(t)
 	var observedSID string
-	srv := httptest.NewServer(mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/start":
 			mgr.Update(r.Context(), func(c *cart) error { c.Items = []string{"x"}; return nil })
@@ -196,7 +196,7 @@ func TestE2E_RenewRotatesSID(t *testing.T) {
 
 func TestE2E_StaleCookieIsIgnored(t *testing.T) {
 	mgr, store := newE2EManager(t)
-	srv := httptest.NewServer(mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mgr.Update(r.Context(), func(c *cart) error { c.Items = []string{"new"}; return nil })
 	})))
 	defer srv.Close()
@@ -240,7 +240,7 @@ func TestE2E_CookieRefreshesOnEachTouchedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
 			mgr.Update(r.Context(), func(c *cart) error { c.Items = []string{"x"}; return nil })
 			return
@@ -283,7 +283,7 @@ func pickCookie(t *testing.T, r *http.Response, name string) *http.Cookie {
 
 func TestE2E_HandlerNoWriteStillEmitsCookie(t *testing.T) {
 	mgr, _ := newE2EManager(t)
-	srv := httptest.NewServer(mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mgr.Update(r.Context(), func(c *cart) error { c.Items = []string{"a"}; return nil })
 		// Deliberately do not write anything.
 	})))
@@ -342,9 +342,9 @@ func TestE2E_CommitFailureDoesNotDoubleWriteHeader(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "sid", Value: seed.SID})
 
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = mgr.Destroy(r.Context())
-		// Handler writes nothing — forces Wrap's tail path to fire.
+		// Handler writes nothing — forces Middleware's tail path to fire.
 	})).ServeHTTP(rr, req)
 
 	if rr.writeHeaderCalls != 1 {
@@ -382,7 +382,7 @@ func TestE2E_HijackPreventsStrayWriteHeaderFromTailPath(t *testing.T) {
 	fake := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
 	req := httptest.NewRequest("GET", "/", nil)
 
-	mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			t.Fatal("committingWriter should expose http.Hijacker")
@@ -390,7 +390,7 @@ func TestE2E_HijackPreventsStrayWriteHeaderFromTailPath(t *testing.T) {
 		if _, _, err := hj.Hijack(); err != nil {
 			t.Fatalf("hijack: %v", err)
 		}
-		// Handler returns here. Wrap's tail path would normally
+		// Handler returns here. Middleware's tail path would normally
 		// call WriteHeader(200) — must not on a hijacked writer.
 	})).ServeHTTP(fake, req)
 

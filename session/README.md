@@ -104,7 +104,7 @@ func main() {
 		_ = mgr.Destroy(r.Context())
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", mgr.Wrap(mux)))
+	log.Fatal(http.ListenAndServe(":8080", mgr.Middleware(mux)))
 }
 
 // Periodically remove expired rows from the SQLite store. Reads

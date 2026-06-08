@@ -369,7 +369,7 @@ func (m *Manager[T]) RevokeAllForUser(ctx context.Context, userID string, except
 }
 
 // stateFromCtx retrieves the per-request session state attached by
-// [Manager.Wrap]. The op string is used to prefix the wrapped
+// [Manager.Middleware]. The op string is used to prefix the wrapped
 // [ErrNoSession] so the diagnostic identifies which Manager method
 // was called outside of a wrapped request.
 func (m *Manager[T]) stateFromCtx(ctx context.Context, op string) (*state[T], error) {

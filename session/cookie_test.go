@@ -82,7 +82,7 @@ func TestCookie_PathScopingViaCookieJar(t *testing.T) {
 		AbsoluteExpiry: time.Hour,
 		IdleExpiry:     time.Minute,
 	})
-	handler := mgr.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := mgr.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Always touch the session so the cookie ships.
 		mgr.Update(r.Context(), func(c *cart) error { return nil })
 	}))
