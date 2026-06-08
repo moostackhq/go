@@ -2,13 +2,17 @@
 
 Authenticates users against a `Store`'s email + password-hash table and writes a session on success.
 
-Routes added by `RegisterRoutes(prefix string, r *router.Router)` at the prefix the caller supplies (e.g. `/auth/user`):
+Routes registered by `RegisterRoutes(r *router.Router)` at the path suffixes the package owns. The caller picks the mount prefix via `router.Router.Group`:
 
-| Route | Method | Purpose |
-|---|---|---|
-| `<prefix>/login` | POST | Verify credentials → write session → `OnSuccess` |
-| `<prefix>/register` | POST | (If `RegisterEnabled`) create user → `OnRegistered` |
-| `<prefix>/logout` | POST | Destroy session → 204 |
+```go
+r.Group("/auth/user", ph.RegisterRoutes)
+```
+
+| Route (relative) | Mounted as (with prefix `/auth/user`) | Method | Purpose |
+|---|---|---|---|
+| `/login` | `/auth/user/login` | POST | Verify credentials → write session → `OnSuccess` |
+| `/register` | `/auth/user/register` | POST | (If `RegisterEnabled`) create user → `OnRegistered` |
+| `/logout` | `/auth/user/logout` | POST | Destroy session → 204 |
 
 Path suffixes are exported as constants — `password.PathLogin`, `password.PathRegister`, `password.PathLogout` (`"/login"` etc.) — so apps build full URLs by concatenation:
 
@@ -16,7 +20,7 @@ Path suffixes are exported as constants — `password.PathLogin`, `password.Path
 loginURL := "/auth/user" + password.PathLogin  // "/auth/user/login"
 ```
 
-A trailing slash on the prefix is normalised, so both `"/auth/user"` and `"/auth/user/"` produce `/auth/user/login`. An empty prefix mounts at the router root (`/login` etc.).
+`Group` bakes the prefix into the registered patterns at the mux level — the routes' patterns ARE the URLs they answer at (visible in `r.Walk`, no dispatch-time stripping). Prefix normalisation (trailing slashes) is `Group`'s concern, not the library's.
 
 The package does NOT render HTML. Your app owns `GET <prefix>/login`; password only handles the POSTs.
 
@@ -55,7 +59,16 @@ ph := password.New(userStore, sessMgr, password.Options{
 
 r := router.New()
 r.Use(sessMgr.Middleware)
-ph.RegisterRoutes("/auth/user", r)
+r.Group("/auth/user", ph.RegisterRoutes)
+```
+
+For per-auth middleware (rate limiting, CSRF, request-ID scoped to the login flow), use the `Group` callback form:
+
+```go
+r.Group("/auth/user", func(g *router.Router) {
+    g.Use(rateLimit, csrf)
+    ph.RegisterRoutes(g)
+})
 ```
 
 `password.New` is generic over the payload type. Go infers it from the session manager — call sites never write the type parameters explicitly.

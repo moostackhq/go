@@ -35,7 +35,7 @@
 //	fa := forwardauth.New(forwardauth.Options{UserHeader: "X-Remote-User"})
 //
 //	r.Use(sessMgr.Middleware)
-//	ph.RegisterRoutes("/auth/user", r)
+//	r.Group("/auth/user", ph.RegisterRoutes)
 //
 //	chain := auth.Chain(fa, ph)
 //	r.Use(auth.Optional(chain))

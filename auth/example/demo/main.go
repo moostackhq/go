@@ -102,11 +102,12 @@ func main() {
 		sessMgr.Middleware,
 	)
 
-	// Password's three routes are added directly to r — no Mount,
-	// no aggregator. The prefix is the app's choice; here we mount
-	// under /auth/user so the resulting routes are
+	// Password's three routes are mounted via r.Group at the prefix
+	// the app chooses — here /auth/user, so the resulting routes are
 	// /auth/user/login, /auth/user/register, /auth/user/logout.
-	ph.RegisterRoutes("/auth/user", r)
+	// Group bakes the prefix into the registered patterns at the mux
+	// level; no Mount gymnastics, no dispatch-time stripping.
+	r.Group("/auth/user", ph.RegisterRoutes)
 
 	// Optional populates identity in context if present, doesn't 401.
 	r.Use(auth.Optional(authChain))

@@ -11,7 +11,7 @@ The auth core knows nothing about sessions, cookies, or stores. Backends that pe
 | Single identity contract | `auth.Identity` is the authenticated principal; handlers read it via `auth.FromContext` and never care which backend produced it. |
 | Function-shaped composition | `auth.Chain(a, b, c)` composes Authenticators. First non-error wins; `ErrUnauthenticated` falls through; any other error short-circuits. No Manager, no aggregator. |
 | App owns the session payload | Apps define their own session payload type carrying identity + cart + locale + whatever. Embed `auth.Identity` and the auth backends pick up identity reads/writes for free via Go's method promotion — no glue code, no adapter struct. |
-| Backends own their routes | Each backend with login routes exposes `RegisterRoutes(prefix, r)` that adds handlers directly to your router under a prefix the app chooses. No Mount gymnastics, no MountableAuth interface. |
+| Backends own their routes | Each backend with login routes exposes `RegisterRoutes(r *router.Router)` so the caller can mount it at any prefix via `r.Group(prefix, backend.RegisterRoutes)`. Group bakes the prefix into the patterns at the mux level — no Mount stripping, no MountableAuth interface, no library-side prefix logic. |
 | Middleware as free functions | `auth.Required(chain)` (401 on miss) and `auth.Optional(chain)` (populate context, don't 401). Both fail closed on store errors. |
 | Customizable | `OnSuccess` / `OnFailure` / `Parser` / `OnRegistered` hooks let you serve JSON, redirect, render HTMX, swap field names. SPA-friendly defaults. |
 | Timing-safe by default | Unknown-email login still runs a bcrypt verify against a dummy hash so attackers can't enumerate registered emails by response time. |
@@ -56,7 +56,7 @@ func main() {
     r := router.New()
     r.Use(sessMgr.Middleware)                      // session lib's own middleware
 
-    ph.RegisterRoutes("/auth/user", r)             // /auth/user/login, /register, /logout
+    r.Group("/auth/user", ph.RegisterRoutes)       // /auth/user/login, /register, /logout
 
     chain := auth.Chain(fa, ph)                    // ph reads identity from the session
     r.Use(auth.Optional(chain))                    // populate identity if present
@@ -152,14 +152,21 @@ Typical chain puts per-request authenticators (forward-auth header, bearer token
 
 ### Backend route registration
 
-Backends that need login routes expose a `RegisterRoutes(prefix string, r *router.Router)` method. The app picks the prefix; the backend appends its known path suffixes (`/login`, `/register`, `/logout`):
+Backends that need login routes expose a `RegisterRoutes(r *router.Router)` method. The caller mounts it at any prefix via `Group`:
 
 ```go
-ph.RegisterRoutes("/auth/user", r)
+r.Group("/auth/user", ph.RegisterRoutes)
 // Registers POST /auth/user/login, /auth/user/register, /auth/user/logout
 ```
 
-No `Mount`, no sub-router, no aggregator. Routes are first-class members of your router — visible in `r.Walk`, composable with group middleware applied later.
+The method-value passes directly as `Group`'s callback — no closure boilerplate. `Group` bakes the prefix into the registered patterns at the mux level, so the routes ARE the URLs they answer at (visible in `r.Walk`, no dispatch-time stripping). For per-auth middleware, inline a callback:
+
+```go
+r.Group("/auth/user", func(g *router.Router) {
+    g.Use(rateLimit, csrf)
+    ph.RegisterRoutes(g)
+})
+```
 
 ### Stateless / API-only
 
@@ -177,7 +184,7 @@ r.Use(auth.Required(chain))
 | Package | What it does |
 |---|---|
 | [`auth/forwardauth`](forwardauth/README.md) | Reads identity from a trusted reverse-proxy header (`X-Remote-User` by default). No routes. |
-| [`auth/password`](password/README.md) | POST `<prefix>/login`, `<prefix>/register` (optional), `<prefix>/logout` — prefix supplied at `RegisterRoutes` time. Verifies via `Hasher` (bcrypt cost 12 default). Timing-safe against unknown-email enumeration. Generic over the app's session payload type. |
+| [`auth/password`](password/README.md) | POST `<prefix>/login`, `<prefix>/register` (optional), `<prefix>/logout` — prefix chosen at `r.Group(prefix, ph.RegisterRoutes)` time. Verifies via `Hasher` (bcrypt cost 12 default). Timing-safe against unknown-email enumeration. Generic over the app's session payload type. |
 
 ## Customisation hooks
 
