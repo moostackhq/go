@@ -1,17 +1,18 @@
 // Package password authenticates users against a [Store]'s email +
 // password-hash table and writes a session on success.
 //
-// Routes mounted by [Provider.RegisterRoutes] at the prefix the
-// caller supplies (e.g. "/auth/user"):
+// Routes registered by [Provider.RegisterRoutes] (paths are relative
+// — the caller picks the mount point via [router.Router.Group]):
 //
-//	POST <prefix>/login    — verify credentials → write session → OnSuccess
-//	POST <prefix>/register — (if RegisterEnabled) create user → OnRegistered
-//	POST <prefix>/logout   — destroy session → 204
+//	POST /login    — verify credentials → write session → OnSuccess
+//	POST /register — (if RegisterEnabled) create user → OnRegistered
+//	POST /logout   — destroy session → 204
 //
 // The path suffixes are exposed as [PathLogin], [PathRegister], and
-// [PathLogout] so apps can build the full URLs by concatenation:
+// [PathLogout] so apps can build the full URLs by concatenation
+// with whatever prefix they chose:
 //
-//	loginURL := "/auth/user" + password.PathLogin
+//	loginURL := "/auth/user" + password.PathLogin // "/auth/user/login"
 //
 // The package does NOT render HTML. Your app owns GET <prefix>/login;
 // password only handles the POSTs.
@@ -25,7 +26,19 @@
 //
 //	sessMgr, _ := session.New(session.Config[AppSession]{...})
 //	ph := password.New(userStore, sessMgr, password.Options{RegisterEnabled: true})
-//	ph.RegisterRoutes("/auth/user", r)
+//
+//	r.Group("/auth/user", ph.RegisterRoutes)
+//
+// Group bakes the prefix into the registered patterns; the mux holds
+// canonical paths like "/auth/user/login" (so [router.Router.Walk]
+// shows real URLs and there is no dispatch-time stripping). Apps
+// that want per-auth middleware do it inline inside the Group
+// callback:
+//
+//	r.Group("/auth/user", func(g *router.Router) {
+//	    g.Use(rateLimit, csrf)
+//	    ph.RegisterRoutes(g)
+//	})
 //
 // The session payload type is whatever the app wants — embedding
 // [auth.Identity] (or implementing [auth.Identifiable] on a named
@@ -45,9 +58,9 @@ import (
 	"github.com/moostackhq/go/session"
 )
 
-// Path suffixes the provider appends to the prefix passed to
-// [Provider.RegisterRoutes]. Exposed so callers can build URLs
-// without restating them:
+// Path suffixes the provider registers under whatever prefix the
+// caller mounts it at via [router.Router.Group]. Exposed so callers
+// can build URLs without restating them:
 //
 //	loginURL := "/auth/user" + password.PathLogin // "/auth/user/login"
 const (
@@ -269,34 +282,28 @@ func New[T any, PT interface {
 	return p
 }
 
-// RegisterRoutes adds the provider's routes to r under prefix:
+// RegisterRoutes registers the provider's routes on r at the path
+// suffixes [PathLogin], [PathRegister], [PathLogout]:
 //
-//	POST <prefix>/login
-//	POST <prefix>/register  (only if Options.RegisterEnabled)
-//	POST <prefix>/logout
+//	POST /login
+//	POST /register  (only if Options.RegisterEnabled)
+//	POST /logout
 //
-// The prefix is normalised on both ends so equivalent shapes all
-// resolve to the same canonical mount point:
+// Prefix handling is the caller's concern via [router.Router.Group]:
 //
-//	"/auth/user"   → /auth/user/login
-//	"/auth/user/"  → /auth/user/login   (trailing slash trimmed)
-//	"auth/user"    → /auth/user/login   (leading slash added)
-//	"auth/user/"   → /auth/user/login   (both)
-//	""             → /login             (root mount)
+//	r.Group("/auth/user", ph.RegisterRoutes)
 //
-// Normalising rather than panicking matches the package's existing
-// trailing-slash leniency and keeps a typo from turning into silent
-// 404s in production.
-func (p *Provider[T]) RegisterRoutes(prefix string, r *router.Router) {
-	prefix = strings.TrimRight(prefix, "/")
-	if prefix != "" && !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-	r.Post(prefix+PathLogin, p.handleLogin)
+// The signature is `func(*router.Router)` so it can be passed
+// directly as a [router.Router.Group] callback — no closure boilerplate.
+// Group bakes the prefix into the registered patterns at the mux
+// level, so the routes' patterns ARE the URLs they answer at
+// (visible in [router.Router.Walk], no dispatch-time stripping).
+func (p *Provider[T]) RegisterRoutes(r *router.Router) {
+	r.Post(PathLogin, p.handleLogin)
 	if p.registerEnabled {
-		r.Post(prefix+PathRegister, p.handleRegister)
+		r.Post(PathRegister, p.handleRegister)
 	}
-	r.Post(prefix+PathLogout, p.handleLogout)
+	r.Post(PathLogout, p.handleLogout)
 }
 
 // Authenticate reads the Identity carried by the request's session.

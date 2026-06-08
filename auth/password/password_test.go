@@ -101,7 +101,7 @@ func newFixture(t *testing.T, opts password.Options) *fixture {
 
 	r := router.New()
 	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes(defaultPrefix, r)
+	r.Group(defaultPrefix, ph.RegisterRoutes)
 	return &fixture{store: store, sessMgr: sessMgr, ph: ph, router: r, prefix: defaultPrefix}
 }
 
@@ -643,8 +643,7 @@ func TestLogin_PromoteFailure_AbortsCleanly(t *testing.T) {
 
 	// CRUCIAL: router does NOT use sessMgr.Middleware.
 	r := router.New()
-	ph.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, ph.RegisterRoutes)
 	req := httptest.NewRequest(http.MethodPost, defaultPrefix+password.PathLogin,
 		strings.NewReader(`{"email":"alice@example.com","password":"correct-password"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1034,8 +1033,7 @@ func TestDefaultOnFailure_LogoutFailure_500(t *testing.T) {
 		Hasher: password.BcryptHasher{Cost: 4},
 	})
 	r := router.New() // NO sessMgr.Middleware
-	prov.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, prov.RegisterRoutes)
 	req := httptest.NewRequest(http.MethodPost, defaultPrefix+password.PathLogout, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -1064,8 +1062,7 @@ func TestDefaultOnFailure_SessionWriteFailure_500(t *testing.T) {
 	_, _ = store.Create(context.Background(), "alice@example.com", hash)
 
 	r := router.New() // NO sessMgr.Middleware
-	prov.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, prov.RegisterRoutes)
 	req := httptest.NewRequest(http.MethodPost, defaultPrefix+password.PathLogin,
 		strings.NewReader(`{"email":"alice@example.com","password":"correct-password"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1252,8 +1249,7 @@ func TestLogout_RoutesThroughOnFailure_OnDestroyError(t *testing.T) {
 	// Build a router WITHOUT sessMgr.Middleware — Destroy will fail
 	// with ErrNoSession.
 	r := router.New()
-	ph.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, ph.RegisterRoutes)
 	req := httptest.NewRequest(http.MethodPost, defaultPrefix+password.PathLogout, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -1351,12 +1347,16 @@ func TestCustomParser_AcceptsAlternateFieldNames(t *testing.T) {
 	}
 }
 
-// --- prefix handling ---
+// --- mounting via Group ---
 
 // TestRegisterRoutes_CustomPrefix proves the routes mount at a
-// caller-supplied prefix, not at the hardcoded "/auth/user". Pins the
-// signature ph.RegisterRoutes(prefix, r) and the prefix+suffix
-// composition.
+// caller-supplied prefix, not at the historical hardcoded
+// "/auth/user". Pins the Group-based composition pattern:
+//
+//	r.Group("/api/v2/identity", ph.RegisterRoutes)
+//
+// — the library doesn't carry any prefix logic; the router's Group
+// bakes the prefix into the registered patterns at the mux level.
 func TestRegisterRoutes_CustomPrefix(t *testing.T) {
 	const customPrefix = "/api/v2/identity"
 
@@ -1377,8 +1377,7 @@ func TestRegisterRoutes_CustomPrefix(t *testing.T) {
 
 	r := router.New()
 	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes(customPrefix, r)
-
+	r.Group(customPrefix, ph.RegisterRoutes)
 	// Routes at the default prefix must NOT respond.
 	defaultRec := httptest.NewRecorder()
 	r.ServeHTTP(defaultRec, httptest.NewRequest(http.MethodPost, "/auth/user"+password.PathLogin, nil))
@@ -1405,10 +1404,19 @@ func TestRegisterRoutes_CustomPrefix(t *testing.T) {
 	}
 }
 
-// TestRegisterRoutes_TrailingSlashPrefix proves a trailing slash on
-// the supplied prefix is normalised so the registered URL is
-// /auth/user/login, not /auth/user//login.
-func TestRegisterRoutes_TrailingSlashPrefix(t *testing.T) {
+// TestRegisterRoutes_GroupMiddlewareScopesToAuthRoutes pins the
+// composability win the Group-based wiring gives: middleware added
+// inside the Group callback applies to ONLY the auth routes,
+// without forcing the caller to wrap the whole router or to thread
+// an extra prefix arg into RegisterRoutes.
+//
+// Concretely: a counter middleware mounted in the Group sees every
+// auth request (login attempts) but NOT requests to unrelated
+// routes registered on the parent router. This is the capability
+// that the previous (prefix, r) signature couldn't express cleanly
+// — the caller had to nest a Group anyway and pass "" as a
+// throwaway prefix.
+func TestRegisterRoutes_GroupMiddlewareScopesToAuthRoutes(t *testing.T) {
 	store := newMemStore()
 	sessMgr, err := session.New(session.Config[auth.Identity]{
 		Store:          session.NewMemoryStore[auth.Identity](),
@@ -1421,93 +1429,40 @@ func TestRegisterRoutes_TrailingSlashPrefix(t *testing.T) {
 	}
 	ph := password.New(store, sessMgr, password.Options{Hasher: password.BcryptHasher{Cost: 4}})
 
+	var authMiddlewareCalls int
+	authScopedMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authMiddlewareCalls++
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	r := router.New()
 	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes("/auth/user/", r) // trailing slash
-
-	hash, _ := password.BcryptHasher{Cost: 4}.Hash("correct-password")
-	_, _ = store.Create(context.Background(), "alice@example.com", hash)
-
-	req := httptest.NewRequest(http.MethodPost, "/auth/user"+password.PathLogin,
-		strings.NewReader(`{"email":"alice@example.com","password":"correct-password"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("login code with trailing-slash prefix = %d, want 204 — prefix normalisation may be broken", rec.Code)
-	}
-}
-
-// TestRegisterRoutes_MissingLeadingSlash proves a prefix without a
-// leading slash is normalised. The package opts for silent
-// correction (matching the trailing-slash behaviour) rather than
-// panicking, so a typo turns into working routes at the obvious
-// place instead of 404s in production.
-func TestRegisterRoutes_MissingLeadingSlash(t *testing.T) {
-	store := newMemStore()
-	sessMgr, err := session.New(session.Config[auth.Identity]{
-		Store:          session.NewMemoryStore[auth.Identity](),
-		Token:          session.Cookie{},
-		AbsoluteExpiry: time.Hour,
-		IdleExpiry:     time.Hour,
+	r.Group(defaultPrefix, func(g *router.Router) {
+		g.Use(authScopedMiddleware)
+		ph.RegisterRoutes(g)
 	})
-	if err != nil {
-		t.Fatalf("session.New: %v", err)
-	}
-	ph := password.New(store, sessMgr, password.Options{Hasher: password.BcryptHasher{Cost: 4}})
-
-	r := router.New()
-	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes("auth/user", r) // NO leading slash
-
-	hash, _ := password.BcryptHasher{Cost: 4}.Hash("correct-password")
-	_, _ = store.Create(context.Background(), "alice@example.com", hash)
-
-	// The canonical URL must respond. If RegisterRoutes had passed
-	// "auth/user/login" to the router unchanged, this request would
-	// 404 — most Go routers reject patterns without a leading slash.
-	req := httptest.NewRequest(http.MethodPost, "/auth/user"+password.PathLogin,
-		strings.NewReader(`{"email":"alice@example.com","password":"correct-password"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("login code = %d, want 204 — missing leading slash should be normalised, not silently broken",
-			rec.Code)
-	}
-}
-
-// TestRegisterRoutes_BothEndsNormalised pins that the leading-slash
-// and trailing-slash normalisations compose — "auth/user/" produces
-// the same canonical mount as "/auth/user".
-func TestRegisterRoutes_BothEndsNormalised(t *testing.T) {
-	store := newMemStore()
-	sessMgr, err := session.New(session.Config[auth.Identity]{
-		Store:          session.NewMemoryStore[auth.Identity](),
-		Token:          session.Cookie{},
-		AbsoluteExpiry: time.Hour,
-		IdleExpiry:     time.Hour,
+	// An unrelated route on the parent — must NOT be touched by the
+	// middleware inside the Group.
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
 	})
-	if err != nil {
-		t.Fatalf("session.New: %v", err)
+
+	// Hit the auth route. Middleware should count once.
+	authReq := httptest.NewRequest(http.MethodPost, defaultPrefix+password.PathLogin,
+		strings.NewReader(`{"email":"x@example.com","password":"y"}`))
+	authReq.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(httptest.NewRecorder(), authReq)
+	if authMiddlewareCalls != 1 {
+		t.Errorf("middleware ran %d times on auth route, want 1 — Group scoping broken", authMiddlewareCalls)
 	}
-	ph := password.New(store, sessMgr, password.Options{Hasher: password.BcryptHasher{Cost: 4}})
 
-	r := router.New()
-	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes("auth/user/", r) // both leading missing AND trailing present
-
-	hash, _ := password.BcryptHasher{Cost: 4}.Hash("correct-password")
-	_, _ = store.Create(context.Background(), "alice@example.com", hash)
-
-	req := httptest.NewRequest(http.MethodPost, "/auth/user"+password.PathLogin,
-		strings.NewReader(`{"email":"alice@example.com","password":"correct-password"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("login code = %d, want 204 — combined leading-missing + trailing-present should normalise to /auth/user",
-			rec.Code)
+	// Hit the unrelated route. Middleware must NOT count.
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if authMiddlewareCalls != 1 {
+		t.Errorf("middleware ran %d times after /healthz, want still 1 — Group middleware leaked to parent routes",
+			authMiddlewareCalls)
 	}
 }
 
@@ -1563,8 +1518,7 @@ func TestRicherSessionPayload_PreservesNonIdentityFields(t *testing.T) {
 
 	r := router.New()
 	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, ph.RegisterRoutes)
 	// Add a route that stamps non-identity fields BEFORE login.
 	r.Post("/seed-locale", func(w http.ResponseWriter, req *http.Request) {
 		if err := sessMgr.Update(req.Context(), func(s *appSession) error {
@@ -1666,8 +1620,7 @@ func TestEmbeddedSessionPayload_EndToEnd(t *testing.T) {
 
 	r := router.New()
 	r.Use(sessMgr.Middleware)
-	ph.RegisterRoutes(defaultPrefix, r)
-
+	r.Group(defaultPrefix, ph.RegisterRoutes)
 	// Stamp non-identity fields BEFORE login.
 	r.Post("/seed-locale", func(w http.ResponseWriter, req *http.Request) {
 		if err := sessMgr.Update(req.Context(), func(s *embeddedSession) error {
