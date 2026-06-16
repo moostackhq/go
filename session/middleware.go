@@ -31,7 +31,7 @@ import (
 func (m *Manager[T]) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sid, _ := m.cfg.Token.Read(r)
-		st := &state[T]{origSID: sid, sid: sid}
+		st := &state[T]{sid: sid}
 		ctx := context.WithValue(r.Context(), m.ctxKey, st)
 
 		cw := &committingWriter{

@@ -400,7 +400,7 @@ func TestSQLiteStore_ConcurrentUpdateThroughManager(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			st := &state[cart]{sid: seed.SID, origSID: seed.SID}
+			st := &state[cart]{sid: seed.SID}
 			ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
 			if err := mgr.Update(ctx, func(c *cart) error {
 				c.Items = append(c.Items, "x")

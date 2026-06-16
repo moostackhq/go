@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,15 +48,28 @@ type Config[T any] struct {
 	// produce deterministic IDs; production leaves it nil.
 	NewSID func() (string, error)
 
-	// Cloner, if set, produces an isolated copy of the payload
-	// that [Manager.Update] passes to its closure. It is called
-	// once per attempt — so the closure can mutate maps, slices,
-	// or pointer-fields without leaking those mutations back into
-	// the per-request state on closure error or terminal commit
-	// failure. Leave nil for value-only payload types (no maps,
-	// no slices accessed by index, no pointers); the default
-	// shallow copy is sufficient there.
-	Cloner func(T) T
+	// NoCloneOnUpdate disables the per-attempt working-copy clone
+	// [Manager.Update] performs by default.
+	//
+	// Default (false): each Update attempt receives a deep clone of
+	// the payload, produced by a JSON encode + decode round-trip.
+	// The closure can mutate maps, slices, and pointer-fields freely
+	// without leaking those mutations back into the per-request
+	// payload on closure error or terminal commit failure.
+	//
+	// Opt-out (true): the closure receives a shallow Go copy. Field
+	// assignments (s.X = y) stay isolated, but writes through shared
+	// reference types — index writes into a slice, mutations of a
+	// map, dereferences of a *T — reach the per-request payload and
+	// survive errors. Set this only when you have measured the JSON
+	// round-trip as a real cost AND audited every Update closure to
+	// never mutate through a reference, OR when your payload is
+	// value-only (no maps, no slices, no pointers).
+	//
+	// Either way, the clone mechanism is independent of the [Store]'s
+	// own codec — stores keep their existing serializers for
+	// persistence; this knob only controls the working copy.
+	NoCloneOnUpdate bool
 }
 
 // Manager is the request-scoped session controller. Construct one per
@@ -65,7 +79,7 @@ type Manager[T any] struct {
 	cfg        Config[T]
 	now        func() time.Time
 	newSID     func() (string, error)
-	clone      func(T) T
+	noClone    bool
 	maxRetries int
 	ctxKey     *managerKey[T]
 }
@@ -107,7 +121,7 @@ func New[T any](cfg Config[T]) (*Manager[T], error) {
 		cfg:        cfg,
 		now:        cfg.Now,
 		newSID:     cfg.NewSID,
-		clone:      cfg.Cloner,
+		noClone:    cfg.NoCloneOnUpdate,
 		maxRetries: cfg.MaxRetries,
 		ctxKey:     &managerKey[T]{},
 	}
@@ -130,14 +144,12 @@ func New[T any](cfg Config[T]) (*Manager[T], error) {
 // to the context. Get/Save/Update/Destroy/Renew/Promote/SID operate on
 // this struct; the middleware drains it at end-of-request.
 //
-// origSID is the SID the client sent on the inbound request, captured
-// once by the middleware and never modified after. sid is the current
-// SID the server is tracking — it can diverge from origSID when a new
-// session is minted, a stale cookie is dropped on load failure, or
-// [Manager.Renew] rotates. Cookie emission at commit time is derived
-// from sid != origSID, so the same rule covers all three cases.
+// sid is the current SID the server is tracking. It starts as the SID
+// the client sent and diverges when a new session is minted, a stale
+// cookie is dropped on load failure, or [Manager.Renew] rotates.
+// Cookie emission is decided in commit: any loaded, non-destroyed
+// session re-emits its cookie, refreshing the sliding expiry.
 type state[T any] struct {
-	origSID string
 	sid     string
 	record  Record[T]
 	loaded  bool
@@ -196,11 +208,14 @@ func (m *Manager[T]) Save(ctx context.Context) error {
 // that need to coordinate session writes with external effects should
 // not use Update.
 //
-// Isolation: the working copy is a shallow Go copy by default. For
-// payload types T that contain maps, slices mutated by index, or
-// pointers, fn's mutations can otherwise reach the underlying
-// per-request state and leak on closure error or terminal commit
-// failure. Set [Config.Cloner] to take a deep copy per attempt.
+// Isolation: by default the working copy is a JSON encode + decode
+// round-trip of the per-request payload, so the closure can mutate
+// maps, slices, and pointer-fields freely without leaking those
+// mutations back on closure error or terminal commit failure. Payloads
+// that don't round-trip cleanly through encoding/json, or hot-path
+// updates where the round-trip cost is measured and unacceptable, can
+// opt out with [Config.NoCloneOnUpdate] — the closure then sees a
+// shallow Go copy and the caller takes on isolation discipline.
 func (m *Manager[T]) Update(ctx context.Context, fn func(*T) error) error {
 	st, err := m.stateFromCtx(ctx, "Update")
 	if err != nil {
@@ -214,9 +229,9 @@ func (m *Manager[T]) Update(ctx context.Context, fn func(*T) error) error {
 	}
 
 	for attempt := 0; ; attempt++ {
-		working := st.payload
-		if m.clone != nil {
-			working = m.clone(working)
+		working, err := m.cloneForUpdate(st.payload)
+		if err != nil {
+			return fmt.Errorf("session.Update: %w", err)
 		}
 		if err := fn(&working); err != nil {
 			return err
@@ -225,7 +240,6 @@ func (m *Manager[T]) Update(ctx context.Context, fn func(*T) error) error {
 		if err == nil {
 			st.record = stored
 			st.payload = stored.Payload
-			st.dirty = true
 			return nil
 		}
 		if !errors.Is(err, ErrVersionConflict) || attempt >= m.maxRetries {
@@ -238,6 +252,29 @@ func (m *Manager[T]) Update(ctx context.Context, fn func(*T) error) error {
 		st.record = fresh
 		st.payload = fresh.Payload
 	}
+}
+
+// cloneForUpdate returns a working copy of v for one [Manager.Update]
+// attempt. Default: JSON encode + decode round-trip — full deep clone,
+// independent backing memory for every slice/map/pointer field. Opt-out
+// (Config.NoCloneOnUpdate): the original is returned unchanged and
+// the closure inherits Go's shallow-copy semantics through its
+// parameter.
+func (m *Manager[T]) cloneForUpdate(v T) (T, error) {
+	if m.noClone {
+		return v, nil
+	}
+	buf, err := json.Marshal(v)
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("encode working copy: %w", err)
+	}
+	var out T
+	if err := json.Unmarshal(buf, &out); err != nil {
+		var zero T
+		return zero, fmt.Errorf("decode working copy: %w", err)
+	}
+	return out, nil
 }
 
 // Destroy marks the session for deletion. The store row is removed and

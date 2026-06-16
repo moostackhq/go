@@ -118,7 +118,9 @@ func TestManager_LazyLoadAndUpdate(t *testing.T) {
 		t.Errorf("expected sid empty before any commit, got %q", st.sid)
 	}
 
-	// Update writes through; SID is generated and dirty is set.
+	// Update writes through immediately, generating a SID. It does
+	// NOT mark the state dirty: the payload is already persisted, so
+	// there is nothing for the end-of-request commit to re-write.
 	err = mgr.Update(ctx, func(p *cart) error {
 		p.Items = append(p.Items, "milk")
 		return nil
@@ -129,11 +131,72 @@ func TestManager_LazyLoadAndUpdate(t *testing.T) {
 	if st.sid == "" {
 		t.Errorf("Update should have generated a SID")
 	}
-	if !st.dirty {
-		t.Errorf("Update should mark state dirty")
+	if st.dirty {
+		t.Errorf("Update should not mark state dirty — it already wrote through")
 	}
-	if st.sid == st.origSID {
-		t.Errorf("Update should have moved sid past origSID for cookie emission")
+}
+
+// countingStore counts Save calls. It does not implement TTLBumper,
+// so a clean end-of-request commit can't sneak in a BumpTTL either.
+type countingStore struct {
+	inner *MemoryStore[cart]
+	saves atomic.Int32
+}
+
+func (s *countingStore) Load(ctx context.Context, sid string) (Record[cart], error) {
+	return s.inner.Load(ctx, sid)
+}
+func (s *countingStore) Save(ctx context.Context, rec Record[cart]) (Record[cart], error) {
+	s.saves.Add(1)
+	return s.inner.Save(ctx, rec)
+}
+func (s *countingStore) Delete(ctx context.Context, sid string) error {
+	return s.inner.Delete(ctx, sid)
+}
+
+// TestManager_Update_SingleWritePerRequest is the regression for the
+// redundant double-write: Update writes through immediately, and the
+// end-of-request commit must NOT write again. One Update over a
+// request lifecycle should produce exactly one store Save and bump
+// the version by exactly one.
+func TestManager_Update_SingleWritePerRequest(t *testing.T) {
+	inner := NewMemoryStore[cart]()
+	seed, _ := inner.Save(context.Background(), Record[cart]{
+		SID:            "sess",
+		AbsoluteExpiry: time.Now().Add(time.Hour),
+		IdleExpiry:     time.Now().Add(time.Hour),
+	})
+	store := &countingStore{inner: inner}
+	mgr, err := New[cart](Config[cart]{
+		Store:          store,
+		Token:          Cookie{},
+		AbsoluteExpiry: time.Hour,
+		IdleExpiry:     time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := &state[cart]{sid: seed.SID, loaded: true, record: seed, payload: seed.Payload}
+	ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
+
+	if err := mgr.Update(ctx, func(c *cart) error {
+		c.Items = append(c.Items, "x")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the middleware's end-of-request finalisation.
+	if err := mgr.commit(ctx, st, httptest.NewRecorder()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := store.saves.Load(); got != 1 {
+		t.Errorf("Update + commit performed %d store writes, want 1 (no redundant re-save)", got)
+	}
+	final, _ := inner.Load(context.Background(), seed.SID)
+	if final.Version != seed.Version+1 {
+		t.Errorf("version = %d, want %d (one increment per Update)", final.Version, seed.Version+1)
 	}
 }
 
@@ -288,7 +351,7 @@ func TestManager_UserID_ReadsLoadedRecord(t *testing.T) {
 		AbsoluteExpiry: time.Now().Add(time.Hour),
 		IdleExpiry:     time.Now().Add(time.Hour),
 	})
-	st := &state[cart]{sid: "abc", origSID: "abc"}
+	st := &state[cart]{sid: "abc"}
 	ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
 	uid, err := mgr.UserID(ctx)
 	if err != nil {
@@ -511,7 +574,7 @@ func TestManager_MutatingMethodsAfterDestroyReturnErrSessionDestroyed(t *testing
 
 	run := func(t *testing.T, fn func(ctx context.Context, mgr *Manager[cart]) error) {
 		t.Helper()
-		st := &state[cart]{sid: seed.SID, origSID: seed.SID}
+		st := &state[cart]{sid: seed.SID}
 		ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
 		if err := mgr.Destroy(ctx); err != nil {
 			t.Fatal(err)
@@ -541,11 +604,13 @@ type bag struct {
 	Items map[string]int
 }
 
-func TestManager_Update_LeaksReferenceMutationsWithoutCloner(t *testing.T) {
-	// Documents the default (shallow-copy) behaviour: a closure
-	// that mutates a map and then returns an error leaves the
-	// mutation visible to a subsequent Get. This is the contract
-	// the Cloner field exists to flip.
+func TestManager_Update_LeaksReferenceMutationsWithNoCloneOnUpdate(t *testing.T) {
+	// Documents the opt-out (shallow-copy) behaviour. With
+	// NoCloneOnUpdate the closure receives a shallow Go copy, so a
+	// mutation that flows through a shared reference (map / slice
+	// backing array / *T) leaks to the per-request payload even
+	// when the closure errors. Callers who set NoCloneOnUpdate
+	// accept that risk.
 	store := NewMemoryStore[bag]()
 	seed, _ := store.Save(context.Background(), Record[bag]{
 		SID:            "abc",
@@ -554,15 +619,16 @@ func TestManager_Update_LeaksReferenceMutationsWithoutCloner(t *testing.T) {
 		Payload:        bag{Items: map[string]int{"a": 1}},
 	})
 	mgr, err := New[bag](Config[bag]{
-		Store:          store,
-		Token:          Cookie{},
-		AbsoluteExpiry: time.Hour,
-		IdleExpiry:     30 * time.Minute,
+		Store:           store,
+		Token:           Cookie{},
+		AbsoluteExpiry:  time.Hour,
+		IdleExpiry:      30 * time.Minute,
+		NoCloneOnUpdate: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := &state[bag]{sid: seed.SID, origSID: seed.SID}
+	st := &state[bag]{sid: seed.SID}
 	ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
 
 	_, _ = mgr.Get(ctx) // populate st.payload from store
@@ -574,11 +640,15 @@ func TestManager_Update_LeaksReferenceMutationsWithoutCloner(t *testing.T) {
 
 	p, _ := mgr.Get(ctx)
 	if _, ok := p.Items["leaked"]; !ok {
-		t.Fatalf("baseline check: expected the leak (this test documents it). Got map=%v", p.Items)
+		t.Fatalf("NoCloneOnUpdate documents that map mutations leak through shallow copy. Got map=%v", p.Items)
 	}
 }
 
-func TestManager_Update_ClonerIsolatesReferenceMutations(t *testing.T) {
+func TestManager_Update_IsolatesReferenceMutationsByDefault(t *testing.T) {
+	// The default working copy is a JSON encode + decode round-trip,
+	// so reference-typed fields get their own backing memory and a
+	// closure that errors mid-mutation cannot corrupt the per-request
+	// payload. No user-side config is required.
 	store := NewMemoryStore[bag]()
 	seed, _ := store.Save(context.Background(), Record[bag]{
 		SID:            "abc",
@@ -591,18 +661,11 @@ func TestManager_Update_ClonerIsolatesReferenceMutations(t *testing.T) {
 		Token:          Cookie{},
 		AbsoluteExpiry: time.Hour,
 		IdleExpiry:     30 * time.Minute,
-		Cloner: func(b bag) bag {
-			out := bag{Items: make(map[string]int, len(b.Items))}
-			for k, v := range b.Items {
-				out.Items[k] = v
-			}
-			return out
-		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := &state[bag]{sid: seed.SID, origSID: seed.SID}
+	st := &state[bag]{sid: seed.SID}
 	ctx := context.WithValue(context.Background(), mgr.ctxKey, st)
 
 	_, _ = mgr.Get(ctx)
@@ -614,7 +677,7 @@ func TestManager_Update_ClonerIsolatesReferenceMutations(t *testing.T) {
 
 	p, _ := mgr.Get(ctx)
 	if _, ok := p.Items["should-not-leak"]; ok {
-		t.Errorf("Cloner should have isolated the map mutation; got map=%v", p.Items)
+		t.Errorf("default isolation should have prevented the map mutation leaking; got map=%v", p.Items)
 	}
 	if v, ok := p.Items["a"]; !ok || v != 1 {
 		t.Errorf("original map content lost: %v", p.Items)
@@ -720,7 +783,7 @@ func TestManager_UpdateRespectsCancelledContextMidRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st := &state[cart]{sid: seed.SID, origSID: seed.SID}
+	st := &state[cart]{sid: seed.SID}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = context.WithValue(ctx, mgr.ctxKey, st)
 

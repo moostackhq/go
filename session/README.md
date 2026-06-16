@@ -180,6 +180,7 @@ type Config[T any] struct {
     IdleExpiry       time.Duration // required; sliding, must be ≤ AbsoluteExpiry
     IdleBumpInterval time.Duration // optional; debounce gap for sliding-expiry refresh, must be ≤ IdleExpiry
     MaxRetries       int           // optional; CAS retry cap for Update (default 3)
+    NoCloneOnUpdate  bool          // optional; disables the default JSON-roundtrip working-copy clone in Update (see Concurrency)
     Now              func() time.Time           // optional; test seam, defaults to time.Now
     NewSID           func() (string, error)     // optional; test seam, defaults to 32-byte crypto/rand base64url
 }
@@ -222,6 +223,26 @@ Pick strict mode when sessions carry data that can't be trivially regenerated; p
 ### Concurrency
 
 `Update(ctx, fn)` is the primitive for read-modify-write. The closure may run more than once (CAS retry), so it must not have external side effects — sending email, charging cards, etc. For everything else (read, then later decide to write), use `Get` and `Save`.
+
+### Update isolation
+
+`Update` hands the closure a deep copy of the payload by default, produced by a JSON encode + decode round-trip. The closure can mutate maps, slices, and pointer-fields freely; if it returns an error or the commit fails, the per-request payload is untouched.
+
+```go
+// safe: even though RecentMonitorIDs is a slice and Claims is a map,
+// neither leak back to the per-request state on closure error.
+mgr.Update(r.Context(), func(s *AppSession) error {
+    s.Theme = "dark"
+    s.RecentMonitorIDs[0] = newID
+    s.Identity.Claims["last_seen"] = time.Now()
+    if !approved { return errors.New("policy denied") }  // payload stays unchanged
+    return nil
+})
+```
+
+The round-trip is one extra `json.Marshal` + `json.Unmarshal` per attempt — microseconds on typical session payloads, and independent of the Store's own codec (the Store keeps whatever serializer it uses for persistence). Sessions are not a hot path; the default favours safety.
+
+If you have measured the cost and want to opt out, set `Config.NoCloneOnUpdate = true`. The closure then receives a shallow Go copy and the caller takes on isolation discipline: writes through shared references (slice index, map key, dereferenced pointer) reach the per-request payload and persist on closure error or commit failure. The opt-out is appropriate for value-only payloads (no maps, no slices, no pointers) where shallow copy is already correct, or for hot-path updates where the round-trip has been benchmarked as the bottleneck and every closure has been audited to never mutate through a reference.
 
 ## Status
 
