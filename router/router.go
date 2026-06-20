@@ -21,6 +21,7 @@ package router
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
@@ -178,6 +179,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		r.root.cachedDispatch = h
 	})
+	// Carry a mutable holder for the matched pattern. dispatch (innermost)
+	// fills it; because it's a pointer in the context, global middleware —
+	// which wrap dispatch from the outside — can read it after serving.
+	// Stdlib leaves Request.Pattern on a downstream request that outer
+	// middleware never see, which is why this indirection is needed.
+	rc := &routeCapture{}
+	req = req.WithContext(context.WithValue(req.Context(), routeCaptureKey{}, rc))
 	r.root.cachedDispatch.ServeHTTP(w, req)
 }
 
@@ -187,12 +195,36 @@ func (rs *rootState) dispatch(w http.ResponseWriter, req *http.Request) {
 		rs.serve404(w, req)
 		return
 	}
+	if rc, ok := req.Context().Value(routeCaptureKey{}).(*routeCapture); ok {
+		rc.pattern = pathPat // a 405 still has a known route; only 404 stays ""
+	}
 	allowed := rs.methodsByPattern[pathPat]
 	if !methodMatches(allowed, req.Method) {
 		rs.serve405(w, req, allowed)
 		return
 	}
 	rs.methodMux.ServeHTTP(w, req)
+}
+
+// routeCaptureKey keys the per-request [routeCapture] holder in the
+// context.
+type routeCaptureKey struct{}
+
+// routeCapture is the mutable cell dispatch writes the matched pattern
+// into, so middleware can read it back out.
+type routeCapture struct{ pattern string }
+
+// RoutePattern returns the route pattern matched for the request — the
+// path pattern as registered, e.g. "/monitors/{id}/check" — or "" if no
+// route matched or the request didn't pass through the [Router]. It is
+// readable from middleware and handlers, and is stable per route
+// (suitable as a low-cardinality metric or log label, unlike the raw
+// path).
+func RoutePattern(ctx context.Context) string {
+	if rc, ok := ctx.Value(routeCaptureKey{}).(*routeCapture); ok {
+		return rc.pattern
+	}
+	return ""
 }
 
 func methodMatches(allowed []string, method string) bool {
